@@ -177,7 +177,12 @@ def zip_is_symlink(info: zipfile.ZipInfo) -> bool:
     return stat.S_ISLNK(mode)
 
 
-def iter_zip(path: str, password: Optional[bytes], limits: Limits) -> Iterator[Member]:
+def iter_zip(
+    path: str,
+    password: Optional[bytes],
+    limits: Limits,
+    progress: Any = None,
+) -> Iterator[Member]:
     try:
         with zipfile.ZipFile(path, "r") as probe:
             infos = probe.infolist()
@@ -205,6 +210,9 @@ def iter_zip(path: str, password: Optional[bytes], limits: Limits) -> Iterator[M
             raise ArchiveError(f"cannot list zip: {type(exc).__name__}: {exc}") from exc
         if len(infos) > limits.max_members:
             raise ArchiveAbort(f"archive has {len(infos)} members (limit {limits.max_members})")
+        if progress is not None:
+            progress.total = sum(1 for info in infos if not info.is_dir())
+            progress.refresh()
 
         total = 0
         for info in infos:
@@ -295,7 +303,12 @@ def iter_tar_gz(path: str, limits: Limits) -> Iterator[Member]:
                 raise ArchiveError(f"tar.gz read error: {type(exc).__name__}: {exc}") from exc
 
 
-def iter_7z(path: str, password: Optional[bytes], limits: Limits) -> Iterator[Member]:
+def iter_7z(
+    path: str,
+    password: Optional[bytes],
+    limits: Limits,
+    progress: Any = None,
+) -> Iterator[Member]:
     try:
         import py7zr  # type: ignore
         from py7zr.io import BytesIOFactory  # type: ignore
@@ -321,6 +334,9 @@ def iter_7z(path: str, password: Optional[bytes], limits: Limits) -> Iterator[Me
             raise ArchiveError(f"cannot list 7z: {type(exc).__name__}: {exc}") from exc
         if len(infos) > limits.max_members:
             raise ArchiveAbort(f"archive has {len(infos)} members (limit {limits.max_members})")
+        if progress is not None:
+            progress.total = sum(1 for info in infos if not info.is_directory)
+            progress.refresh()
 
         total = 0
         batch: List[Any] = []
@@ -752,7 +768,49 @@ def wait_for_result(
 _SINKS: Optional[Sinks] = None
 _SEEN: Optional[Dict[bytes, Optional[int]]] = None
 _STATS: Optional[Dict[str, int]] = None
+_PROGRESS: Any = None
 _FEATURE_VERSION = 2
+
+
+def make_progress(desc: str, enabled: bool):  # type: ignore[no-untyped-def]
+    if not enabled:
+        return None
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return None
+    return tqdm(
+        total=None,
+        desc=sanitize_name(desc, 40),
+        unit="file",
+        file=sys.stderr,
+        dynamic_ncols=True,
+        leave=True,
+        mininterval=0.5,
+        maxinterval=5.0,
+        disable=False,
+    )
+
+
+def _update_progress() -> None:
+    if _PROGRESS is None or _STATS is None:
+        return
+    try:
+        _PROGRESS.set_postfix(
+            pe=_STATS["pe"],
+            done=_STATS["extracted"],
+            skip=_STATS["skipped"] + _STATS["skipped_not_pe"],
+            dup=_STATS["duplicates"] + _STATS["label_conflicts"],
+            err=(
+                _STATS["timeouts"]
+                + _STATS["crashes"]
+                + _STATS["parse_errors"]
+                + _STATS["record_errors"]
+                + _STATS["archive_errors"]
+            ),
+        )
+    except Exception:
+        pass
 
 
 def _close_conn(conn: Any) -> None:
@@ -777,6 +835,7 @@ def _record_success(item: Pending, features: Dict[str, Any]) -> None:
             _STATS["label_0"] += 1
         elif item.label == 1:
             _STATS["label_1"] += 1
+        _update_progress()
     else:
         _SINKS.errors.write_obj(
             {
@@ -789,6 +848,7 @@ def _record_success(item: Pending, features: Dict[str, Any]) -> None:
         )
         _SEEN[item.digest] = item.label
         _STATS["record_errors"] += 1
+        _update_progress()
 
 
 def _record_failure(item: Pending, kind: str, reason: str) -> None:
@@ -809,6 +869,7 @@ def _record_failure(item: Pending, kind: str, reason: str) -> None:
         _STATS["crashes"] += 1
     else:
         _STATS["parse_errors"] += 1
+    _update_progress()
 
 
 def process_members(
@@ -821,12 +882,19 @@ def process_members(
     seen: Dict[bytes, Optional[int]],
     stats: Dict[str, int],
     sinks: Sinks,
+    progress: Any = None,
 ) -> None:
+    global _PROGRESS
+
+    _PROGRESS = progress
     pending: Dict[Any, Pending] = {}
     inflight: Dict[bytes, int] = {}
     try:
         for member in members:
             stats["members"] += 1
+            if progress is not None:
+                progress.update(1)
+            _update_progress()
             if member.skip_reason:
                 sinks.skipped.write_obj(
                     {
@@ -837,6 +905,7 @@ def process_members(
                     }
                 )
                 stats["skipped"] += 1
+                _update_progress()
                 continue
             if member.error_reason or member.data is None:
                 sinks.errors.write_obj(
@@ -849,6 +918,7 @@ def process_members(
                     }
                 )
                 stats["parse_errors"] += 1
+                _update_progress()
                 continue
 
             data = member.data
@@ -862,6 +932,7 @@ def process_members(
                     }
                 )
                 stats["skipped_not_pe"] += 1
+                _update_progress()
                 continue
 
             digest = hashlib.sha256(data).digest()
@@ -881,6 +952,7 @@ def process_members(
                     stats["label_conflicts"] += 1
                 else:
                     stats["duplicates"] += 1
+                _update_progress()
                 continue
 
             while len(pending) >= workers:
@@ -908,6 +980,7 @@ def process_members(
                 )
                 seen[digest] = label
                 stats["crashes"] += 1
+                _update_progress()
                 continue
             _close_conn(send_conn)
             pending[recv_conn] = Pending(
@@ -922,6 +995,7 @@ def process_members(
             )
             inflight[digest] = label
             stats["pe"] += 1
+            _update_progress()
 
         while pending:
             wait_for_result(pending, next_timeout(pending), inflight)
@@ -933,6 +1007,7 @@ def process_members(
         raise
     finally:
         terminate_all(pending, inflight)
+        _PROGRESS = None
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1028,14 +1103,17 @@ def run(args: argparse.Namespace) -> int:
                 )
                 stats["archive_errors"] += 1
                 continue
+            bar = make_progress(archive_name, args.progress)
             try:
                 fmt = detect_format(archive_path, args.format)
                 if fmt == "zip":
-                    members: Iterable[Member] = iter_zip(archive_path, password, limits)
+                    members: Iterable[Member] = iter_zip(
+                        archive_path, password, limits, progress=bar
+                    )
                 elif fmt == "tar.gz":
                     members = iter_tar_gz(archive_path, limits)
                 elif fmt == "7z":
-                    members = iter_7z(archive_path, password, limits)
+                    members = iter_7z(archive_path, password, limits, progress=bar)
                 else:  # pragma: no cover - argparse restricts this
                     raise ArchiveError(f"unsupported format: {fmt}")
                 process_members(
@@ -1048,6 +1126,7 @@ def run(args: argparse.Namespace) -> int:
                     seen,
                     stats,
                     sinks,
+                    bar,
                 )
             except ArchiveError as exc:
                 sinks.errors.write_obj(
@@ -1074,10 +1153,14 @@ def run(args: argparse.Namespace) -> int:
                         f"unexpected archive error: {archive_name}: {type(exc).__name__}: {exc}",
                         file=sys.stderr,
                     )
+            finally:
+                if bar is not None:
+                    bar.close()
 
         for benign_dir in args.benign_dir:
             stats["archives"] += 1
             name = sanitize_name(os.path.basename(os.path.abspath(benign_dir)))
+            bar = make_progress(name, args.progress)
             try:
                 process_members(
                     iter_benign_dir(benign_dir, limits),
@@ -1089,6 +1172,7 @@ def run(args: argparse.Namespace) -> int:
                     seen,
                     stats,
                     sinks,
+                    bar,
                 )
             except ArchiveError as exc:
                 sinks.errors.write_obj(
@@ -1108,6 +1192,9 @@ def run(args: argparse.Namespace) -> int:
                     }
                 )
                 stats["archive_errors"] += 1
+            finally:
+                if bar is not None:
+                    bar.close()
     finally:
         sinks.close()
 
@@ -1264,6 +1351,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("train", "test"),
         default="train",
         help="name for vectorized output (default: train)",
+    )
+    parser.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        default=True,
+        help="show per-archive progress on stderr (default: on)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="disable progress output",
     )
     parser.add_argument("--verbose", action="store_true", help="print per-archive errors")
     return parser
