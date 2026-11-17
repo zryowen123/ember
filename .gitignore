@@ -39,3 +39,12 @@ metadata.csv
 ember_model_*.txt
 model.txt
 CLAUDE.md
+
+# Batch feature extraction outputs, sample archives, and password files
+out/
+archives/
+*.errors.jsonl
+*.skipped.jsonl
+*.pass
+secrets/
+docs

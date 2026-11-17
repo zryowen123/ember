@@ -1,0 +1,27 @@
+# Batch PE feature extraction image.
+#
+# Kept separate from Dockerfile so the official LIEF 0.9.0 reproduction image
+# is not changed. py7zr 1.1 requires Python >= 3.10, which in turn needs
+# py-lief 0.12.1 on Linux (0.9.0 is only built for Python <= 3.8).
+FROM mambaorg/micromamba:1.5.10
+
+WORKDIR /ember
+
+COPY --chown=$MAMBA_USER:$MAMBA_USER requirements_extract.txt /ember/
+RUN micromamba install -y -n base --channel conda-forge \
+        python=3.10 \
+        py-lief=0.12.1 \
+        "tqdm>=4.31.0" \
+        "numpy>=1.23" \
+        pandas \
+        lightgbm \
+        scikit-learn \
+        setuptools \
+        wheel \
+        --file requirements_extract.txt && \
+    micromamba clean --all --yes
+ARG MAMBA_DOCKERFILE_ACTIVATE=1
+
+COPY --chown=$MAMBA_USER:$MAMBA_USER . /ember
+
+RUN python -m pip install --no-deps --no-build-isolation .
