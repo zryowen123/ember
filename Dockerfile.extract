@@ -18,6 +18,7 @@ RUN micromamba install -y -n base --channel conda-forge \
         scikit-learn \
         setuptools \
         wheel \
+        p7zip \
         --file requirements_extract.txt && \
     micromamba clean --all --yes
 ARG MAMBA_DOCKERFILE_ACTIVATE=1

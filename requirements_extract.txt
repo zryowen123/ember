@@ -1,2 +1,5 @@
+# The default 7z backend is in-memory py7zr. The optional system backend
+# (--7z-backend system) needs the `7za` command from p7zip:
+#   apt install p7zip-full   or   conda install -c conda-forge p7zip
 py7zr>=1.1,<2
 pyzipper>=0.3.6,<1

@@ -23,10 +23,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import struct
+import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import zipfile
 import zlib
@@ -49,6 +52,7 @@ GZIP_MAGIC = b"\x1f\x8b"
 PE_SIGNATURE = b"PE\0\0"
 BATCH_BUDGET_BYTES = 256 * MIB
 BATCH_MAX_MEMBERS = 256
+_SYSTEM_7Z_WARNED = False
 
 
 class ArchiveError(Exception):
@@ -303,7 +307,7 @@ def iter_tar_gz(path: str, limits: Limits) -> Iterator[Member]:
                 raise ArchiveError(f"tar.gz read error: {type(exc).__name__}: {exc}") from exc
 
 
-def iter_7z(
+def iter_7z_py7zr(
     path: str,
     password: Optional[bytes],
     limits: Limits,
@@ -413,6 +417,345 @@ def iter_7z(
             batch_bytes += info.uncompressed
 
         yield from flush(batch)
+
+
+def find_7z_command(command: str) -> str:
+    if os.path.sep in command or "/" in command:
+        if os.path.isfile(command) and os.access(command, os.X_OK):
+            return command
+        raise ArchiveError(f"7z command is not executable: {command}")
+    candidates = [command]
+    for fallback in ("7z", "7zz"):
+        if fallback not in candidates:
+            candidates.append(fallback)
+    for name in candidates:
+        found = shutil.which(name)
+        if found:
+            return found
+        local = os.path.join(os.path.dirname(sys.executable), name)
+        if os.path.isfile(local) and os.access(local, os.X_OK):
+            return local
+    raise ArchiveError(
+        f"{command} not found; install p7zip/7-Zip or use --7z-backend py7zr"
+    )
+
+
+def run_7z_command(
+    command: Sequence[str], timeout: float, password: Optional[str]
+) -> Tuple[int, str, str]:
+    try:
+        completed = subprocess.run(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout if timeout > 0 else None,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise ArchiveError(f"7z command not found: {command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ArchiveError(f"7z command timed out after {timeout} seconds") from exc
+    stdout = completed.stdout.decode("utf-8", "replace")
+    stderr = completed.stderr.decode("utf-8", "replace")
+    if password:
+        stderr = stderr.replace(password, "***")
+    return completed.returncode, stdout, stderr
+
+
+def parse_7z_slt(output: str) -> List[Dict[str, str]]:
+    lines = output.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.startswith("----------"):
+            start = index + 1
+            break
+    if start is None:
+        return []
+    entries: List[Dict[str, str]] = []
+    current: Dict[str, str] = {}
+    for line in lines[start:]:
+        if not line.strip():
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        if " = " in line:
+            key, value = line.split(" = ", 1)
+            current[key.strip()] = value
+    if current:
+        entries.append(current)
+    return entries
+
+
+def entry_size(entry: Dict[str, str]) -> int:
+    try:
+        return int(entry.get("Size", "0").strip() or 0)
+    except ValueError:
+        return 0
+
+
+def entry_kind(entry: Dict[str, str]) -> Tuple[bool, bool]:
+    attributes = entry.get("Attributes", "")
+    parts = attributes.split()
+    unix_mode = parts[-1] if parts else ""
+    is_dir = (
+        attributes.startswith("D")
+        or unix_mode.startswith("d")
+        or entry.get("Folder") == "+"
+    )
+    is_symlink = unix_mode.startswith("l")
+    return is_dir, is_symlink
+
+
+def secure_extracted_tree(root: str) -> None:
+    """Remove executable bits before reading untrusted extracted files."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in list(dirnames):
+            full_path = os.path.join(dirpath, name)
+            if os.path.islink(full_path):
+                dirnames.remove(name)
+                continue
+            try:
+                os.chmod(full_path, 0o700)
+            except OSError:
+                pass
+        for name in filenames:
+            full_path = os.path.join(dirpath, name)
+            if os.path.islink(full_path):
+                continue
+            try:
+                os.chmod(full_path, 0o600)
+            except OSError:
+                pass
+
+
+def iter_7z_system(
+    path: str,
+    password: Optional[bytes],
+    limits: Limits,
+    progress: Any = None,
+    command: str = "7za",
+    extract_base: Optional[str] = None,
+    keep: bool = False,
+    timeout: float = 600.0,
+) -> Iterator[Member]:
+    """Extract with the system 7za CLI into a temporary directory.
+
+    The archive is listed first so member/size/compression limits are enforced
+    before anything is written. Only selected members are extracted via a
+    ``@listfile``. The temporary directory is removed afterward unless
+    ``keep`` is true.
+    """
+    if not os.path.exists(path):
+        raise ArchiveError(f"archive does not exist: {path}")
+    seven_zip = find_7z_command(command)
+
+    password_str: Optional[str] = None
+    if password is not None:
+        try:
+            password_str = password.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ArchiveError("7z passwords must be UTF-8") from exc
+
+    list_cmd = [seven_zip, "l", "-slt", "-bd", path]
+    if password_str:
+        list_cmd.append("-p" + password_str)
+    returncode, listing, stderr = run_7z_command(list_cmd, timeout, password_str)
+    if returncode != 0:
+        raise ArchiveError(
+            f"7z listing failed (exit {returncode}): {stderr.strip()[:500]}"
+        )
+    entries = parse_7z_slt(listing)
+    if not entries:
+        raise ArchiveError("7z listing returned no members")
+
+    non_dir = [entry for entry in entries if not entry_kind(entry)[0]]
+    if len(non_dir) > limits.max_members:
+        raise ArchiveAbort(f"archive has {len(non_dir)} members (limit {limits.max_members})")
+    if progress is not None:
+        progress.total = len(non_dir)
+        progress.refresh()
+
+    targets: List[str] = []
+    target_names: set[str] = set()
+    selected_bytes = 0
+    for entry in entries:
+        name = sanitize_name(entry.get("Path", ""))
+        size = entry_size(entry)
+        is_dir, is_symlink = entry_kind(entry)
+        if is_dir:
+            continue
+        if is_symlink:
+            yield Member(name, size, skip_reason="symlink")
+            continue
+        raw_name = entry.get("Path", "")
+        normalized = raw_name.replace("\\", "/")
+        if (
+            not raw_name
+            or normalized.startswith("/")
+            or any(part == ".." for part in normalized.split("/"))
+        ):
+            yield Member(name, size, error_reason="unsafe archive path")
+            continue
+        if "\n" in raw_name or "\r" in raw_name:
+            yield Member(name, size, error_reason="member name contains newline")
+            continue
+        if normalized in target_names:
+            yield Member(name, size, error_reason="duplicate member name")
+            continue
+        target_names.add(normalized)
+        if entry.get("Encrypted") == "+" and not password_str:
+            yield Member(name, size, error_reason="password required for encrypted member")
+            continue
+        if size > limits.max_file_size:
+            yield Member(name, size, skip_reason="too_large")
+            continue
+        try:
+            packed = int(entry.get("Packed Size", "0").strip() or 0)
+        except ValueError:
+            packed = 0
+        if size >= MIB and packed > 0 and size / packed > limits.max_compression_ratio:
+            yield Member(name, size, skip_reason="compression_ratio")
+            continue
+        if selected_bytes + size > limits.max_total_bytes:
+            yield Member(name, size, skip_reason="total_budget")
+            continue
+        targets.append(raw_name)
+        selected_bytes += size
+
+    if not targets:
+        return
+
+    base = extract_base or tempfile.gettempdir()
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    extract_dir = tempfile.mkdtemp(prefix="ember_7z_", dir=base)
+    list_path: Optional[str] = None
+    try:
+        fd, list_path = tempfile.mkstemp(prefix="ember_7z_targets_", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            for target in targets:
+                handle.write(target + "\n")
+
+        extract_cmd = [
+            seven_zip,
+            "x",
+            path,
+            "@" + list_path,
+            "-o" + extract_dir,
+            "-y",
+            "-bd",
+            "-spd",
+            "-scsUTF-8",
+        ]
+        if password_str:
+            extract_cmd.append("-p" + password_str)
+        returncode, _stdout, stderr = run_7z_command(
+            extract_cmd, timeout, password_str
+        )
+        if returncode not in (0, 1):
+            raise ArchiveError(
+                f"7z extraction failed (exit {returncode}): {stderr.strip()[:500]}"
+            )
+
+        secure_extracted_tree(extract_dir)
+        expected = {os.path.normpath(target.replace("\\", "/")) for target in targets}
+        found: set[str] = set()
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(extract_dir, followlinks=False):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not os.path.islink(os.path.join(dirpath, name))
+            ]
+            for filename in filenames:
+                full_path = os.path.join(dirpath, filename)
+                relative = os.path.relpath(full_path, extract_dir)
+                normalized = os.path.normpath(relative.replace("\\", "/"))
+                found.add(normalized)
+                name = sanitize_name(relative)
+                if normalized not in expected:
+                    yield Member(name, 0, skip_reason="unexpected_extracted_file")
+                    continue
+                if os.path.islink(full_path):
+                    yield Member(name, 0, skip_reason="symlink")
+                    continue
+                try:
+                    info = os.lstat(full_path)
+                except OSError as exc:
+                    yield Member(name, 0, error_reason=f"{type(exc).__name__}: {exc}")
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    yield Member(name, info.st_size, skip_reason="not_regular_file")
+                    continue
+                if info.st_size > limits.max_file_size:
+                    yield Member(name, info.st_size, skip_reason="too_large")
+                    continue
+                try:
+                    with open(full_path, "rb") as handle:
+                        data = read_capped(handle, limits.max_file_size)
+                except (OSError, ArchiveAbort) as exc:
+                    yield Member(
+                        name, info.st_size, error_reason=f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                total += len(data)
+                if total > limits.max_total_bytes:
+                    raise ArchiveAbort(
+                        f"archive exceeds max_total_bytes ({limits.max_total_bytes})"
+                    )
+                yield Member(name, len(data), data=data)
+
+        for missing in sorted(expected - found):
+            yield Member(sanitize_name(missing), 0, error_reason="not extracted")
+    finally:
+        if list_path:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
+        if keep:
+            print(
+                f"WARNING: kept extracted 7z samples in {extract_dir}",
+                file=sys.stderr,
+            )
+        else:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
+
+def iter_7z(
+    path: str,
+    password: Optional[bytes],
+    limits: Limits,
+    progress: Any = None,
+    backend: str = "system",
+    command: str = "7za",
+    extract_base: Optional[str] = None,
+    keep: bool = False,
+    timeout: float = 600.0,
+) -> Iterator[Member]:
+    global _SYSTEM_7Z_WARNED
+    if backend == "py7zr":
+        yield from iter_7z_py7zr(path, password, limits, progress)
+    else:
+        if not _SYSTEM_7Z_WARNED:
+            print(
+                "WARNING: --7z-backend system extracts selected samples to a "
+                "temporary directory; use --7z-backend py7zr for in-memory-only "
+                "processing.",
+                file=sys.stderr,
+            )
+            _SYSTEM_7Z_WARNED = True
+        yield from iter_7z_system(
+            path,
+            password,
+            limits,
+            progress,
+            command,
+            extract_base,
+            keep,
+            timeout,
+        )
 
 
 def iter_benign_dir(root: str, limits: Limits) -> Iterator[Member]:
@@ -883,6 +1226,7 @@ def process_members(
     stats: Dict[str, int],
     sinks: Sinks,
     progress: Any = None,
+    allow_label_conflict: bool = False,
 ) -> None:
     global _PROGRESS
 
@@ -940,16 +1284,28 @@ def process_members(
             if digest in seen or digest in inflight:
                 previous = seen.get(digest) if digest in seen else inflight.get(digest)
                 if isinstance(previous, int) and previous != label:
+                    message = (
+                        f"label conflict: {sha256} is already recorded with label "
+                        f"{previous}, but {archive_name}:{member.name} was requested "
+                        f"as label {label}; the existing record was kept"
+                    )
                     sinks.errors.write_obj(
                         {
                             "sha256": sha256,
                             "archive": archive_name,
                             "member": member.name,
                             "error": "label_conflict",
-                            "message": f"already seen with label {previous}, now {label}",
+                            "message": message,
                         }
                     )
                     stats["label_conflicts"] += 1
+                    if not allow_label_conflict:
+                        raise SystemExit(
+                            message
+                            + ". Use a fresh output file, or pass "
+                            "--allow-label-conflict to keep the first label."
+                        )
+                    print(f"WARNING: {message}", file=sys.stderr)
                 else:
                     stats["duplicates"] += 1
                 _update_progress()
@@ -1103,6 +1459,11 @@ def run(args: argparse.Namespace) -> int:
                 )
                 stats["archive_errors"] += 1
                 continue
+            if args.verbose:
+                print(
+                    f"processing {archive_path} with label {archive_label}",
+                    file=sys.stderr,
+                )
             bar = make_progress(archive_name, args.progress)
             try:
                 fmt = detect_format(archive_path, args.format)
@@ -1113,7 +1474,17 @@ def run(args: argparse.Namespace) -> int:
                 elif fmt == "tar.gz":
                     members = iter_tar_gz(archive_path, limits)
                 elif fmt == "7z":
-                    members = iter_7z(archive_path, password, limits, progress=bar)
+                    members = iter_7z(
+                        archive_path,
+                        password,
+                        limits,
+                        progress=bar,
+                        backend=args.seven_zip_backend,
+                        command=args.seven_zip_command,
+                        extract_base=args.seven_zip_extract_dir,
+                        keep=args.keep_7z_extract,
+                        timeout=args.seven_zip_timeout,
+                    )
                 else:  # pragma: no cover - argparse restricts this
                     raise ArchiveError(f"unsupported format: {fmt}")
                 process_members(
@@ -1127,6 +1498,7 @@ def run(args: argparse.Namespace) -> int:
                     stats,
                     sinks,
                     bar,
+                    args.allow_label_conflict,
                 )
             except ArchiveError as exc:
                 sinks.errors.write_obj(
@@ -1160,6 +1532,8 @@ def run(args: argparse.Namespace) -> int:
         for benign_dir in args.benign_dir:
             stats["archives"] += 1
             name = sanitize_name(os.path.basename(os.path.abspath(benign_dir)))
+            if args.verbose:
+                print(f"processing {benign_dir} with label 0", file=sys.stderr)
             bar = make_progress(name, args.progress)
             try:
                 process_members(
@@ -1173,6 +1547,7 @@ def run(args: argparse.Namespace) -> int:
                     stats,
                     sinks,
                     bar,
+                    args.allow_label_conflict,
                 )
             except ArchiveError as exc:
                 sinks.errors.write_obj(
@@ -1256,6 +1631,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="label applied to --archive entries (default: 1)",
     )
+    parser.add_argument(
+        "--allow-label-conflict",
+        action="store_true",
+        help="keep the first label when the same sha256 appears with a different label",
+    )
     parser.add_argument("--output", required=True, help="output JSONL path")
     parser.add_argument("--errors", help="error JSONL path (default: <output>.errors.jsonl)")
     parser.add_argument("--skipped", help="skipped JSONL path (default: <output>.skipped.jsonl)")
@@ -1264,6 +1644,38 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "zip", "7z", "tar.gz"),
         default="auto",
         help="archive format (default: sniff magic bytes)",
+    )
+    parser.add_argument(
+        "--7z-backend",
+        dest="seven_zip_backend",
+        choices=("py7zr", "system"),
+        default="py7zr",
+        help="7z backend: py7zr reads in memory (default); system uses 7za and "
+        "writes selected samples to a temporary directory",
+    )
+    parser.add_argument(
+        "--7z-command",
+        dest="seven_zip_command",
+        default="7za",
+        help="7z executable for the system backend (default: 7za)",
+    )
+    parser.add_argument(
+        "--7z-extract-dir",
+        dest="seven_zip_extract_dir",
+        help="base directory for temporary 7z extraction (default: system temp)",
+    )
+    parser.add_argument(
+        "--keep-7z-extract",
+        dest="keep_7z_extract",
+        action="store_true",
+        help="keep extracted 7z files (plaintext samples on disk; debugging only)",
+    )
+    parser.add_argument(
+        "--7z-timeout",
+        dest="seven_zip_timeout",
+        type=float,
+        default=600.0,
+        help="timeout per 7z list/extract command in seconds (default: 600)",
     )
     password_group = parser.add_mutually_exclusive_group()
     password_group.add_argument("--password-file", help="file containing the archive password")
