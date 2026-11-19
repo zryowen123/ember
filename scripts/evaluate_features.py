@@ -15,6 +15,10 @@ Examples:
     python scripts/evaluate_features.py features.jsonl \
         --train --test-size 0.3 --seed 42
 
+    # Report confusion-matrix metrics at specific score thresholds
+    python scripts/evaluate_features.py features.jsonl \
+        --model /data/ember2018/ember_model_2018.txt --threshold 0.5 0.9
+
 The input must contain both label=0 and label=1 records. Unlabeled records
 (label=-1) are ignored. Metrics are printed to stdout; LightGBM logs go to
 stderr.
@@ -388,7 +392,7 @@ def print_operating_points(points: List[Tuple[str, Dict[str, Any]]]) -> None:
     print(header)
     print("-" * len(header))
     for name, point in points:
-        if name in ("threshold 0.5", "best F1"):
+        if name == "best F1" or name.startswith("threshold "):
             target_text = "-"
         else:
             target = point.get("target_fpr", point.get("target_tpr"))
@@ -423,6 +427,7 @@ def evaluate(
     scores: np.ndarray,
     target_fprs: Sequence[float],
     partial_auc_max_fpr: float,
+    thresholds: Sequence[float] = (0.5,),
 ) -> Dict[str, Any]:
     if len(y) != len(scores):
         raise SystemExit(f"label/score length mismatch: {len(y)} vs {len(scores)}")
@@ -456,9 +461,10 @@ def evaluate(
         point = operating_point(y, scores, target)
         point["name"] = f"target_fpr_{target:g}"
         points.append((f"target FPR {target:g}", point))
-    point = threshold_metrics(y, scores, 0.5)
-    point["name"] = "threshold_0.5"
-    points.append(("threshold 0.5", point))
+    for threshold in thresholds:
+        point = threshold_metrics(y, scores, float(threshold))
+        point["name"] = f"threshold_{threshold:g}"
+        points.append((f"threshold {threshold:g}", point))
     point = best_f1_point(y, scores)
     point["name"] = "best_f1"
     points.append(("best F1", point))
@@ -499,6 +505,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="target false-positive rates (default: 0.01 0.001)",
     )
     parser.add_argument(
+        "--threshold",
+        nargs="+",
+        type=float,
+        default=[0.5],
+        help="score threshold(s) for classification metrics (default: 0.5)",
+    )
+    parser.add_argument(
         "--partial-auc-max-fpr",
         type=float,
         default=0.005,
@@ -528,6 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     if any(target < 0 or target > 1 for target in args.target_fpr):
         raise SystemExit("--target-fpr values must be in [0, 1]")
+    if any(threshold < 0 or threshold > 1 for threshold in args.threshold):
+        raise SystemExit("--threshold values must be in [0, 1]")
+    # Drop duplicates while preserving order so the table has one row per value.
+    thresholds = list(dict.fromkeys(float(t) for t in args.threshold))
     if not (0 < args.test_size < 1):
         raise SystemExit("--test-size must be between 0 and 1")
     if args.save_model and not (args.train or args.train_features):
@@ -646,7 +663,9 @@ def run(args: argparse.Namespace) -> int:
 
         if labels.size == 0:
             raise SystemExit("no labeled records to evaluate")
-        results = evaluate(labels, scores, args.target_fpr, args.partial_auc_max_fpr)
+        results = evaluate(
+            labels, scores, args.target_fpr, args.partial_auc_max_fpr, thresholds
+        )
         n_pos = results["counts"]["positive"]
         n_neg = results["counts"]["negative"]
         warnings: List[str] = []

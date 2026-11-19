@@ -654,8 +654,18 @@ def iter_7z_system(
             extract_cmd, timeout, password_str
         )
         if returncode not in (0, 1):
+            detail = stderr.strip()[:500]
+            hint = ""
+            if "E_FAIL" in detail:
+                hint = (
+                    "; E_FAIL is generic: check the password and archive "
+                    "integrity, the compression method (try a newer 7zz via "
+                    "--7z-command, or --7z-backend py7zr), and free space in "
+                    "the extraction directory"
+                )
             raise ArchiveError(
-                f"7z extraction failed (exit {returncode}): {stderr.strip()[:500]}"
+                f"7z extraction failed (exit {returncode}, "
+                f"{len(targets)} selected members): {detail}{hint}"
             )
 
         secure_extracted_tree(extract_dir)
